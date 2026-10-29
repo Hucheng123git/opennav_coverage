@@ -54,3 +54,7 @@ cmake-build-debug/
 
 # doxygen docs
 doc/html/
+
+# Local coverage map demo dependencies, build output, and edited maps
+/.deps/
+/.coverage_demo/

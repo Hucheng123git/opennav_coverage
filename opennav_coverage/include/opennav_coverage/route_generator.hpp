@@ -76,6 +76,13 @@ public:
   Swaths generateRoute(
     const Swaths & swaths, const opennav_coverage_msgs::msg::RouteMode & settings);
 
+  /** CONCENTRIC generates boundary geometry before the parallel-swath stages. */
+  bool usesConcentric(const opennav_coverage_msgs::msg::RouteMode & settings)
+  {
+    const auto type = toType(settings.mode);
+    return (type == RouteType::UNKNOWN ? default_type_ : type) == RouteType::CONCENTRIC;
+  }
+
   /**
    * @brief Sets the mode manually of the Route for dynamic parameters
    * @param mode String for mode to use

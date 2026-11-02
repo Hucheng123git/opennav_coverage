@@ -76,6 +76,16 @@ public:
    */
   void setWidth(const double & width) {default_headland_width_ = width;}
 
+  /** Resolve the CONSTANT inset without discarding split polygon components. */
+  double resolveWidth(const opennav_coverage_msgs::msg::HeadlandMode & settings)
+  {
+    const auto type = toType(settings.mode);
+    if ((type == HeadlandType::UNKNOWN ? default_type_ : type) != HeadlandType::CONSTANT) {
+      throw CoverageException("No valid headlands mode set! Options: CONSTANT.");
+    }
+    return type == HeadlandType::UNKNOWN ? default_headland_width_ : settings.width;
+  }
+
 protected:
   /**
    * @brief Creates generator pointer of a requested type

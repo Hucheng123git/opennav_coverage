@@ -26,7 +26,7 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
     - Class: rviz_default_plugins/MarkerArray
-      Name: Field boundary and holes
+      Name: Field and obstacles
       Enabled: true
       Topic:
         Value: /coverage_map/field
@@ -34,9 +34,26 @@ Visualization Manager:
         Durability Policy: Transient Local
         History Policy: Keep Last
         Reliability Policy: Reliable
-    - Class: rviz_default_plugins/Path
-      Name: Coverage path
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Ordered coverage plan
       Enabled: true
+      Namespaces:
+        coverage_work: true
+        coverage_turns: true
+        coverage_direction: true
+        coverage_swath_numbers: true
+        coverage_endpoints: true
+        coverage_endpoint_labels: true
+        coverage_legend: true
+      Topic:
+        Value: /coverage_map/plan_markers
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Path
+      Name: Raw path (optional)
+      Enabled: false
       Alpha: 1
       Color: 255; 70; 20
       Line Style: Billboards
@@ -49,8 +66,8 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
     - Class: rviz_default_plugins/Marker
-      Name: Swaths
-      Enabled: true
+      Name: Raw swaths (optional)
+      Enabled: false
       Topic:
         Value: /coverage_server/swaths
         Depth: 1
@@ -58,7 +75,7 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
     - Class: rviz_default_plugins/Polygon
-      Name: Planning boundary after headland
+      Name: Planning boundary
       Enabled: true
       Color: 255; 200; 0
       Topic:

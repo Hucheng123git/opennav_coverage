@@ -40,6 +40,11 @@ def generate_launch_description():
         DeclareLaunchArgument('spiral_n', default_value='4'),
         DeclareLaunchArgument('swath_angle', default_value='0.0'),
         DeclareLaunchArgument(
+            'contour_spacing', default_value='0.0',
+            description='CONCENTRIC contour spacing in meters; 0 uses the server default'),
+        DeclareLaunchArgument('arrow_spacing', default_value='2.0'),
+        DeclareLaunchArgument('show_swath_numbers', default_value='true'),
+        DeclareLaunchArgument(
             'params_file', default_value=os.path.join(demo_dir, 'coverage_map_params.yaml')),
         Node(
             package='tf2_ros', executable='static_transform_publisher',
@@ -75,6 +80,12 @@ def generate_launch_description():
                 'spiral_n': ParameterValue(LaunchConfiguration('spiral_n'), value_type=int),
                 'swath_angle': ParameterValue(
                     LaunchConfiguration('swath_angle'), value_type=float),
+                'contour_spacing': ParameterValue(
+                    LaunchConfiguration('contour_spacing'), value_type=float),
+                'arrow_spacing': ParameterValue(
+                    LaunchConfiguration('arrow_spacing'), value_type=float),
+                'show_swath_numbers': ParameterValue(
+                    LaunchConfiguration('show_swath_numbers'), value_type=bool),
                 'auto_plan': ParameterValue(LaunchConfiguration('auto_plan'), value_type=bool),
             }]),
         Node(

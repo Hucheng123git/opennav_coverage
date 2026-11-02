@@ -18,6 +18,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <utility>
 
@@ -209,7 +210,7 @@ inline opennav_coverage_msgs::msg::PathComponents toCoveragePathMsg(
 inline nav_msgs::msg::Path toNavPathMsg(
   const Path & raw_path, const F2CField & field,
   const std_msgs::msg::Header & header, const bool is_cartesian,
-  const float & pt_dist)
+  const float & pt_dist, const bool include_final_endpoint = false)
 {
   using f2c::types::PathSectionType;
   nav_msgs::msg::Path msg;
@@ -224,6 +225,46 @@ inline nav_msgs::msg::Path toNavPathMsg(
     path = f2c::Transform::transformToPrevCRS(raw_path, field);
   } else {
     path.moveTo(field.getRefPoint());
+  }
+
+  if (include_final_endpoint) {
+    // Opt-in contour conversion: retain every corner and the final endpoint.
+    // Compute samples from doubles rather than accumulating float increments.
+    constexpr size_t max_poses = 1000000;
+    if (!std::isfinite(pt_dist) || pt_dist <= 0.0) {
+      throw std::invalid_argument("Polyline point distance must be finite and positive");
+    }
+    for (size_t index = 0; index < path.states.size(); ++index) {
+      const auto & state = path.states[index];
+      size_t subdivisions = 1;
+      bool interpolate = index > 0 && state.type == PathSectionType::SWATH &&
+        path.states[index - 1].type == PathSectionType::SWATH;
+      if (interpolate) {
+        const auto & start = path.states[index - 1].point;
+        const double required = std::ceil(
+          std::hypot(state.point.getX() - start.getX(), state.point.getY() - start.getY()) /
+          pt_dist);
+        if (!std::isfinite(required) || required > max_poses - msg.poses.size()) {
+          throw std::invalid_argument("Concentric navigation path exceeds the point limit");
+        }
+        subdivisions = std::max<size_t>(1, static_cast<size_t>(required));
+      }
+      if (subdivisions > max_poses - msg.poses.size()) {
+        throw std::invalid_argument("Concentric navigation path exceeds the point limit");
+      }
+      for (size_t sample = 1; sample <= subdivisions; ++sample) {
+        auto pose = toMsg(state);
+        pose.header = header;
+        if (interpolate) {
+          const auto & start = path.states[index - 1].point;
+          const double fraction = static_cast<double>(sample) / subdivisions;
+          pose.pose.position.x = start.getX() + fraction * (state.point.getX() - start.getX());
+          pose.pose.position.y = start.getY() + fraction * (state.point.getY() - start.getY());
+        }
+        msg.poses.push_back(std::move(pose));
+      }
+    }
+    return msg;
   }
 
   for (unsigned int i = 0; i != path.states.size(); i++) {
@@ -288,8 +329,18 @@ inline F2CField getFieldFromGoal(
   auto polygons = goal->polygons;
   if (polygons.size() == 0) {
     throw std::invalid_argument("No field set in action goal!");
-  } else if (polygons[0].coordinates.front() != polygons[0].coordinates.back()) {
-    throw std::invalid_argument("Outer polygon malformed, first element must equal last!");
+  }
+  for (const auto & polygon : polygons) {
+    if (polygon.coordinates.size() < 4 ||
+      polygon.coordinates.front() != polygon.coordinates.back())
+    {
+      throw std::invalid_argument("Polygon rings must contain at least 4 points and be closed");
+    }
+    for (const auto & point : polygon.coordinates) {
+      if (!std::isfinite(point.axis1) || !std::isfinite(point.axis2)) {
+        throw std::invalid_argument("Polygon coordinates must be finite");
+      }
+    }
   }
 
   // Get the outer most polygon (usually the only one if no voids)

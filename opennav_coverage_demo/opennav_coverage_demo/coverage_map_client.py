@@ -32,7 +32,11 @@ from lifecycle_msgs.msg import State
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.srv import LoadMap
 from nav_msgs.msg import Path
-from opennav_coverage_demo.coverage_map import load_field
+from opennav_coverage_demo.coverage_map import load_field, validate_field
+from opennav_coverage_demo.coverage_visualization import (
+    empty_plan_markers,
+    make_plan_markers,
+)
 from opennav_coverage_msgs.action import ComputeCoveragePath
 from opennav_coverage_msgs.msg import Coordinate, Coordinates
 import rclpy
@@ -40,10 +44,85 @@ from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.task import Future
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
+
+
+def make_coverage_goal(field, route_type='SPIRAL', spiral_n=4, swath_angle=0.0,
+                       custom_order=(), contour_spacing=0.0):
+    """Create a complete coverage goal for the editable-map demo or exporters.
+
+    CUSTOM requires a nonempty permutation of 0..N-1. Its indices refer to the
+    swaths sorted by their original identifiers. The coverage server checks that
+    N matches the actual generated swath count, which depends on its settings.
+    CONCENTRIC follows inward polygon contours with straight links and can turn
+    in place; contour_spacing=0 uses the server default or its operation width.
+    """
+    routes = ('SPIRAL', 'BOUSTROPHEDON', 'SNAKE', 'CUSTOM', 'CONCENTRIC')
+    if not isinstance(route_type, str):
+        raise ValueError('route_type must be one of: ' + ', '.join(routes))
+    route = route_type.upper()
+    if route not in routes:
+        raise ValueError('route_type must be one of: ' + ', '.join(routes))
+    if isinstance(spiral_n, bool) or not isinstance(spiral_n, int) or not 1 <= spiral_n <= 65535:
+        raise ValueError('spiral_n must be an integer between 1 and 65535')
+    angle = float(swath_angle)
+    if not math.isfinite(angle) or abs(angle) > 3.402823466e38:
+        raise ValueError('swath_angle must be finite and fit in float32 (radians)')
+    try:
+        spacing = float(contour_spacing)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            'contour_spacing must be finite and greater than or equal to zero') from error
+    if isinstance(contour_spacing, bool) or not math.isfinite(spacing) or spacing < 0.0:
+        raise ValueError('contour_spacing must be finite and greater than or equal to zero')
+    order = []
+    if route == 'CUSTOM':
+        try:
+            order = list(custom_order)
+        except TypeError as error:
+            raise ValueError(
+                'CUSTOM custom_order must be a nonempty integer permutation') from error
+        if not order:
+            raise ValueError('CUSTOM requires a nonempty custom_order permutation of 0..N-1')
+        if any(isinstance(index, bool) or not isinstance(index, int) or not 0 <= index <= 65535
+               for index in order):
+            raise ValueError('CUSTOM custom_order indices must be integers between 0 and 65535')
+        if set(order) != set(range(len(order))):
+            raise ValueError('CUSTOM custom_order must be a complete permutation of 0..N-1')
+
+    field = validate_field(field)
+    goal = ComputeCoveragePath.Goal()
+    goal.generate_headland = True
+    goal.generate_route = True
+    goal.generate_path = True
+    goal.use_gml_file = False
+    goal.frame_id = field['frame_id']
+    for ring in [field['boundary'], *field['holes']]:
+        polygon = Coordinates()
+        for x, y in ring:
+            if max(abs(x), abs(y)) > 3.402823466e38:
+                raise ValueError('field coordinates exceed the action message float32 range')
+            point = Coordinate()
+            point.axis1 = float(x)
+            point.axis2 = float(y)
+            polygon.coordinates.append(point)
+        goal.polygons.append(polygon)
+    # UNKNOWN uses the coverage server's configured headland/turn settings.
+    goal.headland_mode.mode = 'UNKNOWN'
+    goal.path_mode.mode = 'POLYLINE' if route == 'CONCENTRIC' else 'UNKNOWN'
+    goal.path_mode.continuity_mode = 'UNKNOWN'
+    goal.swath_mode.objective = 'LENGTH'
+    goal.swath_mode.mode = 'SET_ANGLE'
+    goal.swath_mode.best_angle = angle
+    goal.route_mode.mode = route
+    goal.route_mode.spiral_n = spiral_n
+    goal.route_mode.custom_order = order
+    goal.route_mode.contour_spacing = spacing
+    return goal
 
 
 @dataclass
@@ -53,6 +132,8 @@ class _PlanningRequest:
     goal: Any
     completion: Future
     deadline: float
+    arrow_spacing: float = 2.0
+    show_swath_numbers: bool = True
     phase: str = 'waiting for active map and coverage servers'
     goal_handle: Any = None
 
@@ -66,8 +147,12 @@ class CoverageMapClient(Node):
         self.declare_parameter('route_type', 'SPIRAL')
         self.declare_parameter('spiral_n', 4)
         self.declare_parameter('swath_angle', 0.0)
+        self.declare_parameter('custom_order', Parameter.Type.INTEGER_ARRAY)
+        self.declare_parameter('contour_spacing', 0.0)
         self.declare_parameter('auto_plan', True)
         self.declare_parameter('timeout', 60.0)
+        self.declare_parameter('arrow_spacing', 2.0)
+        self.declare_parameter('show_swath_numbers', True)
 
         self._lock = threading.RLock()
         self._active: Optional[_PlanningRequest] = None
@@ -78,6 +163,8 @@ class CoverageMapClient(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self._path_pub = self.create_publisher(Path, '/coverage_map/path', retained)
         self._field_pub = self.create_publisher(MarkerArray, '/coverage_map/field', retained)
+        self._plan_markers_pub = self.create_publisher(
+            MarkerArray, '/coverage_map/plan_markers', retained)
         self._map_client = self.create_client(
             LoadMap, '/map_server/load_map', callback_group=self._group)
         self._coverage_client = ActionClient(
@@ -124,6 +211,9 @@ class CoverageMapClient(Node):
             timeout = float(self.get_parameter('timeout').value)
             if not math.isfinite(timeout) or timeout <= 0.0:
                 raise ValueError('timeout must be a positive, finite number of seconds')
+            arrow_spacing = float(self.get_parameter('arrow_spacing').value)
+            if not math.isfinite(arrow_spacing) or arrow_spacing <= 0.0:
+                raise ValueError('arrow_spacing must be a positive, finite distance in meters')
             goal = self._make_goal(field)
         except (OSError, ValueError, TypeError, OverflowError) as error:
             message = f'Invalid map or planning settings: {error}'
@@ -133,48 +223,19 @@ class CoverageMapClient(Node):
 
         request = _PlanningRequest(
             field=field, map_yaml=map_yaml, goal=goal, completion=completion,
-            deadline=time.monotonic() + timeout)
+            deadline=time.monotonic() + timeout, arrow_spacing=arrow_spacing,
+            show_swath_numbers=self.get_parameter('show_swath_numbers').value)
         self._active = request
         self._advance(request)
         return completion
 
     def _make_goal(self, field):
-        route = self.get_parameter('route_type').value.upper()
-        if route not in ('SPIRAL', 'BOUSTROPHEDON', 'SNAKE'):
-            raise ValueError('route_type must be SPIRAL, BOUSTROPHEDON, or SNAKE')
-        spiral_n = self.get_parameter('spiral_n').value
-        if not 1 <= spiral_n <= 65535:
-            raise ValueError('spiral_n must be between 1 and 65535')
-        angle = float(self.get_parameter('swath_angle').value)
-        if not math.isfinite(angle) or abs(angle) > 3.402823466e38:
-            raise ValueError('swath_angle must be finite and fit in float32 (radians)')
-
-        goal = ComputeCoveragePath.Goal()
-        goal.generate_headland = True
-        goal.generate_route = True
-        goal.generate_path = True
-        goal.use_gml_file = False
-        goal.frame_id = field['frame_id']
-        for ring in [field['boundary'], *field['holes']]:
-            polygon = Coordinates()
-            for x, y in ring:
-                if max(abs(x), abs(y)) > 3.402823466e38:
-                    raise ValueError('field coordinates exceed the action message float32 range')
-                point = Coordinate()
-                point.axis1 = float(x)
-                point.axis2 = float(y)
-                polygon.coordinates.append(point)
-            goal.polygons.append(polygon)
-        # UNKNOWN uses the coverage server's configured headland/turn settings.
-        goal.headland_mode.mode = 'UNKNOWN'
-        goal.path_mode.mode = 'UNKNOWN'
-        goal.path_mode.continuity_mode = 'UNKNOWN'
-        goal.swath_mode.objective = 'LENGTH'
-        goal.swath_mode.mode = 'SET_ANGLE'
-        goal.swath_mode.best_angle = angle
-        goal.route_mode.mode = route
-        goal.route_mode.spiral_n = spiral_n
-        return goal
+        return make_coverage_goal(
+            field, route_type=self.get_parameter('route_type').value,
+            spiral_n=self.get_parameter('spiral_n').value,
+            swath_angle=self.get_parameter('swath_angle').value,
+            custom_order=self.get_parameter_or('custom_order').value or (),
+            contour_spacing=self.get_parameter('contour_spacing').value)
 
     def _tick(self):
         with self._lock:
@@ -249,7 +310,7 @@ class CoverageMapClient(Node):
             return
         request.phase = 'loading map'
         # An empty retained Path removes a previous result while this map loads.
-        self._clear_path(request.field['frame_id'])
+        self._clear_plan(request.field['frame_id'])
         map_request = LoadMap.Request()
         map_request.map_url = str(request.map_yaml)
         try:
@@ -329,10 +390,18 @@ class CoverageMapClient(Node):
                     if previous is not None:
                         length += math.hypot(point.x - previous.x, point.y - previous.y)
                     previous = point
+                markers = make_plan_markers(
+                    path, result.coverage_path, request.goal.route_mode.mode,
+                    request.goal.route_mode.spiral_n, self.get_clock().now().to_msg(),
+                    arrow_spacing=request.arrow_spacing,
+                    show_swath_numbers=request.show_swath_numbers,
+                    contour_spacing=request.goal.route_mode.contour_spacing)
                 self._path_pub.publish(path)
+                self._plan_markers_pub.publish(markers)
                 self._finish(
                     request, True, f'Planned {len(path.poses)} poses, {length:.2f} m; '
-                    'published /coverage_map/path.')
+                    f'route={request.goal.route_mode.mode}; '
+                    'published /coverage_map/path and /coverage_map/plan_markers.')
             except Exception as error:
                 self._finish(request, False, f'Could not obtain the coverage path: {error}')
 
@@ -353,11 +422,12 @@ class CoverageMapClient(Node):
             except Exception as error:
                 self.get_logger().warning(f'Could not cancel coverage goal: {error}')
 
-    def _clear_path(self, frame_id):
+    def _clear_plan(self, frame_id):
         empty = Path()
         empty.header.frame_id = frame_id
         empty.header.stamp = self.get_clock().now().to_msg()
         self._path_pub.publish(empty)
+        self._plan_markers_pub.publish(empty_plan_markers(frame_id, empty.header.stamp))
 
     def _publish_field(self, field):
         markers = MarkerArray()

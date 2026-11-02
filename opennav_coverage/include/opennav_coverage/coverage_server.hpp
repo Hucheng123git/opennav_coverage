@@ -28,6 +28,7 @@
 #include "opennav_coverage/swath_generator.hpp"
 #include "opennav_coverage/route_generator.hpp"
 #include "opennav_coverage/path_generator.hpp"
+#include "opennav_coverage/concentric_generator.hpp"
 #include "opennav_coverage/visualizer.hpp"
 
 namespace opennav_coverage
@@ -127,8 +128,10 @@ protected:
   std::unique_ptr<SwathGenerator> swath_gen_;
   std::unique_ptr<RouteGenerator> route_gen_;
   std::unique_ptr<PathGenerator> path_gen_;
+  std::unique_ptr<ConcentricGenerator> concentric_gen_;
   std::unique_ptr<Visualizer> visualizer_;
   bool cartesian_frame_;
+  double default_contour_spacing_{0.0};
 };
 
 }  // namespace opennav_coverage

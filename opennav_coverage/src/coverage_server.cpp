@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
+#include <cmath>
+
 #include "opennav_coverage/coverage_server.hpp"
 
 using namespace std::chrono_literals;
@@ -38,7 +41,16 @@ CoverageServer::on_configure(const rclcpp_lifecycle::State & /*state*/)
   swath_gen_ = std::make_unique<SwathGenerator>(node, robot_params_.get());
   route_gen_ = std::make_unique<RouteGenerator>(node);
   path_gen_ = std::make_unique<PathGenerator>(node, robot_params_.get());
+  concentric_gen_ = std::make_unique<ConcentricGenerator>();
   visualizer_ = std::make_unique<Visualizer>();
+
+  nav2_util::declare_parameter_if_not_declared(
+    node, "default_contour_spacing", rclcpp::ParameterValue(0.0));
+  get_parameter("default_contour_spacing", default_contour_spacing_);
+  if (!std::isfinite(default_contour_spacing_) || default_contour_spacing_ < 0.0) {
+    RCLCPP_ERROR(get_logger(), "default_contour_spacing must be finite and nonnegative");
+    return nav2_util::CallbackReturn::FAILURE;
+  }
 
   // If in GPS coordinates, we must convert to a CRS to compute coverage
   // Then, reconvert back to GPS for the user.
@@ -104,6 +116,7 @@ CoverageServer::on_cleanup(const rclcpp_lifecycle::State & /*state*/)
   action_server_.reset();
   visualizer_.reset();
   path_gen_.reset();
+  concentric_gen_.reset();
   route_gen_.reset();
   swath_gen_.reset();
   headland_gen_.reset();
@@ -166,6 +179,7 @@ void CoverageServer::computeCoveragePath()
     RCLCPP_WARN(get_logger(), "Goal contained invalid configurations!");
     result->error_code = ComputeCoveragePath::Result::INVALID_REQUEST;
     action_server_->terminate_current(result);
+    return;
   }
 
   try {
@@ -192,38 +206,89 @@ void CoverageServer::computeCoveragePath()
       "Generating coverage path in %s frame for zone with %zu outer nodes and %zu inner polygons.",
       frame_id.c_str(), field.getGeometry(0).size(), field.size() - 1);
 
-    // (1) Optional: Remove headland from polygon field
-    Field field_no_headland = field;
-    if (goal->generate_headland) {
-      field_no_headland = headland_gen_->generateHeadlands(field, goal->headland_mode);
-    }
-
-    // (2) Generate swaths to cover polygon field, including internal voids
-    Swaths swaths = swath_gen_->generateSwaths(field_no_headland, goal->swath_mode);
-
-    // (3) Optional: Generate an ordered route through the unordered swaths
     std_msgs::msg::Header header;
     header.stamp = now();
     header.frame_id = frame_id;
+    Field field_no_headland = field;
+    Swaths swaths;
     Path path;
-    if (goal->generate_route) {
-      Swaths route = route_gen_->generateRoute(swaths, goal->route_mode);
-
-      // (4) Optional: Generate connection turns between ordered swaths
-      // Converts UTM back to GPS, if necessary, for action returns
+    const bool concentric = route_gen_->usesConcentric(goal->route_mode);
+    float visualization_distance = path_gen_->getTurnPointDistance();
+    if (concentric) {
+      // Boundary offsets must precede parallel-swath generation. Keep every
+      // split polygon and hole; HeadlandGenerator's single-Cell API cannot do so.
+      std::string path_mode = goal->path_mode.mode;
+      util::toUpper(path_mode);
+      if (goal->generate_path && path_mode != "UNKNOWN" && path_mode != "POLYLINE") {
+        throw std::invalid_argument(
+                "CONCENTRIC uses POLYLINE paths; Dubins/Reeds-Shepp smoothing is not supported");
+      }
+      double spacing = goal->route_mode.contour_spacing;
+      if (!std::isfinite(spacing) || spacing < 0.0) {
+        throw std::invalid_argument("contour_spacing must be finite and nonnegative");
+      }
+      if (spacing == 0.0) {
+        spacing = default_contour_spacing_;
+      }
+      if (spacing == 0.0) {
+        spacing = robot_params_->getOperationWidth();
+      }
+      const double clearance = robot_params_->getWidth() / 2.0;
+      const double reserve = goal->generate_headland ?
+        headland_gen_->resolveWidth(goal->headland_mode) : 0.0;
+      if (!std::isfinite(reserve) || reserve < 0.0) {
+        throw std::invalid_argument("CONCENTRIC headland width must be finite and nonnegative");
+      }
+      const float point_distance = path_mode == "POLYLINE" ?
+        goal->path_mode.turn_point_distance : path_gen_->getTurnPointDistance();
+      visualization_distance = point_distance;
+      auto contours = concentric_gen_->generate(
+        field, spacing, std::max(reserve, clearance), clearance, point_distance,
+        [this]() {return action_server_->is_cancel_requested();}, goal->generate_path);
+      swaths = std::move(contours.swaths);
+      path = std::move(contours.path);
       if (goal->generate_path) {
-        path = path_gen_->generatePath(route, goal->path_mode);
         result->coverage_path =
           util::toCoveragePathMsg(path, master_field, header, cartesian_frame_);
         result->nav_path = util::toNavPathMsg(
-          path, master_field, header, cartesian_frame_, path_gen_->getTurnPointDistance());
+          path, master_field, header, cartesian_frame_, point_distance, true);
+      } else {
+        result->coverage_path = util::toCoveragePathMsg(
+          swaths, master_field, goal->generate_route, header, cartesian_frame_);
+      }
+      // PolygonStamped cannot represent all inset components and holes. Clear
+      // that optional outline; the demo's field MarkerArray retains all rings.
+      field_no_headland = Field();
+      RCLCPP_INFO(
+        get_logger(), "CONCENTRIC: %zu contours, %zu edges, spacing %.3f m (POLYLINE)",
+        contours.contour_count, swaths.size(), spacing);
+    } else {
+      // Existing parallel-swath modes retain their original planning pipeline.
+      if (goal->generate_headland) {
+        field_no_headland = headland_gen_->generateHeadlands(field, goal->headland_mode);
+      }
+      swaths = swath_gen_->generateSwaths(field_no_headland, goal->swath_mode);
+      if (goal->generate_route) {
+        Swaths route = route_gen_->generateRoute(swaths, goal->route_mode);
+        if (goal->generate_path) {
+          path = path_gen_->generatePath(route, goal->path_mode);
+          result->coverage_path =
+            util::toCoveragePathMsg(path, master_field, header, cartesian_frame_);
+          result->nav_path = util::toNavPathMsg(
+            path, master_field, header, cartesian_frame_, path_gen_->getTurnPointDistance());
+        } else {
+          result->coverage_path =
+            util::toCoveragePathMsg(route, master_field, true, header, cartesian_frame_);
+        }
       } else {
         result->coverage_path =
-          util::toCoveragePathMsg(route, master_field, true, header, cartesian_frame_);
+          util::toCoveragePathMsg(swaths, master_field, false, header, cartesian_frame_);
       }
-    } else {
-      result->coverage_path =
-        util::toCoveragePathMsg(swaths, master_field, false, header, cartesian_frame_);
+    }
+
+    if (action_server_->is_cancel_requested()) {
+      action_server_->terminate_all();
+      return;
     }
 
     auto cycle_duration = this->now() - start_time;
@@ -232,9 +297,10 @@ void CoverageServer::computeCoveragePath()
     // Visualize in Cartesian coordinates for debugging
     visualizer_->visualize(
       field, field_no_headland, master_field.getRefPoint(),
-      util::toCartesianNavPathMsg(path, header, path_gen_->getTurnPointDistance()),
+      util::toNavPathMsg(path, F2CField(), header, true, visualization_distance, concentric),
       swaths, header);
     action_server_->succeeded_current(result);
+    return;
   } catch (CoverageException & e) {
     RCLCPP_ERROR(get_logger(), "Invalid mode set: %s", e.what());
     result->error_code = ComputeCoveragePath::Result::INVALID_MODE_SET;
@@ -246,7 +312,11 @@ void CoverageServer::computeCoveragePath()
     result->error_code = ComputeCoveragePath::Result::INTERNAL_F2C_ERROR;
   }
 
-  action_server_->terminate_current(result);
+  if (action_server_->is_cancel_requested()) {
+    action_server_->terminate_all();
+  } else {
+    action_server_->terminate_current(result);
+  }
 }
 
 rcl_interfaces::msg::SetParametersResult
@@ -254,12 +324,24 @@ CoverageServer::dynamicParametersCallback(std::vector<rclcpp::Parameter> paramet
 {
   std::lock_guard<std::mutex> lock(dynamic_params_lock_);
   rcl_interfaces::msg::SetParametersResult result;
+  for (const auto & parameter : parameters) {
+    if (parameter.get_name() == "default_contour_spacing" &&
+      (parameter.get_type() != ParameterType::PARAMETER_DOUBLE ||
+      !std::isfinite(parameter.as_double()) || parameter.as_double() < 0.0))
+    {
+      result.successful = false;
+      result.reason = "default_contour_spacing must be a finite, nonnegative double";
+      return result;
+    }
+  }
   for (auto parameter : parameters) {
     const auto & type = parameter.get_type();
     const auto & name = parameter.get_name();
 
     if (type == ParameterType::PARAMETER_DOUBLE) {
-      if (name == "default_headland_width") {
+      if (name == "default_contour_spacing") {
+        default_contour_spacing_ = parameter.as_double();
+      } else if (name == "default_headland_width") {
         headland_gen_->setWidth(parameter.as_double());
       } else if (name == "default_swath_angle") {
         swath_gen_->setSwathAngle(parameter.as_double());

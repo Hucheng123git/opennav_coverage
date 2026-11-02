@@ -14,6 +14,7 @@ coverage_server:
     default_swath_angle: 0.0
     default_route_type: "SPIRAL"
     default_spiral_n: 4
+    default_contour_spacing: 0.0
     default_path_type: "DUBIN"
     default_path_continuity_type: "DISCONTINUOUS"
     default_turn_point_distance: 0.1

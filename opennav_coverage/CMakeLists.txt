@@ -52,6 +52,7 @@ add_library(${library_name} SHARED
   src/swath_generator.cpp
   src/route_generator.cpp
   src/path_generator.cpp
+  src/concentric_generator.cpp
   src/visualizer.cpp
 )
 

@@ -74,8 +74,8 @@ void Visualizer::visualize(
         headlandless_polygon->polygon.points.push_back(
           util::toMsg(planning_field.getGeometry(i) + ref_pt));
       }
-      planning_field_pub_->publish(std::move(headlandless_polygon));
     }
+    planning_field_pub_->publish(std::move(headlandless_polygon));
   }
 
   // Visualize swaths alone
